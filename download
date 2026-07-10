@@ -1,0 +1,29 @@
+# ── Secrets / credentials ─────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ── Data: never commit real customer data ─────────────
+# keep only the small anonymised samples under data/sample/
+data/*
+!data/sample/
+!data/sample/**
+
+# ── Power BI (large binaries — prefer screenshots or Git LFS) ──
+*.pbix
+
+# ── OS / editor ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
