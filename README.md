@@ -1,206 +1,113 @@
-# Pipeline Intelligente per la Gestione Ordini — Acme Manufacturing
+# ACME Order Management — from PDF orders to a Power BI dashboard
 
-Sistema multi-agente basato su **Azure AI Foundry** che automatizza la ricezione, classificazione,
-validazione e correzione degli ordini commerciali ricevuti in formato PDF, con esportazione
-automatica verso ERP.
+End-to-end pipeline that turns unstructured **PDF purchase orders** into clean, analytics-ready data.
+A **multi-agent LLM pipeline** (Azure AI Foundry) extracts, validates and corrects each order; a
+**Microsoft Fabric medallion architecture** (PySpark + Delta Lake) then models the data into a
+**star schema** that powers a **Power BI** dashboard.
 
-Progetto realizzato come project work per la valutazione di una figura **AI Engineer**.
-
----
-
-## Indice
-
-- [Architettura](#architettura)
-- [I tre agenti](#i-tre-agenti)
-- [Struttura del repository](#struttura-del-repository)
-- [Setup](#setup)
-- [Esecuzione](#esecuzione)
-- [Formato dati di input](#formato-dati-di-input)
-- [Output generati](#output-generati)
-- [Principio di design](#principio-di-design)
+> **Design principle:** the LLM does only what *only* an LLM can do — reading free text.
+> Business rules, joins, aggregations and data-quality checks are deterministic Python / PySpark.
 
 ---
 
-## Architettura
+## 🧭 End-to-end architecture
 
-```
-PDF ordine
-    │
-    ▼
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Agente 1   │────▶│  Agente 2   │────▶│  Agente 3   │
-│Classificazione│    │ Validazione │◀────│ Correzione  │
-└─────────────┘     └─────────────┘     └─────────────┘
-                            │                (max 2 tentativi)
-                            ▼
-                     ┌─────────────┐
-                     │  CSV → ERP  │
-                     └─────────────┘
+```mermaid
+flowchart LR
+    PDF["📄 PDF order"] --> A1["Agent 1 · Classify"] --> A2["Agent 2 · Validate"] --> A3["Agent 3 · Correct"]
+    A3 --> SILVER["🥈 Silver<br/>silver_validation<br/>silver_correction"]
+    BRONZE["🥉 Bronze<br/>clienti · articoli<br/>ordini storici (CSV)"] --> SILVER
+    SILVER --> GOLD["🥇 Gold · star schema<br/>fact_ordini + dim_clienti<br/>dim_articoli · dim_data"]
+    GOLD --> PBI["📊 Power BI · Direct Lake"]
 ```
 
-Il flusso è orchestrato interamente in Python (`src/main.py`). Nessuna chiamata LLM
-viene usata per instradamento, calcoli, validazioni logiche o esportazione dati —
-solo per i compiti che richiedono comprensione del linguaggio naturale.
+The agents are only **stage one**. The part most LLM demos skip — turning extracted orders into a
+**governed, queryable data model** — is where this project spends most of its effort.
 
-## I tre agenti
+---
 
-| Agente | Modello | Ruolo | Input | Output |
-|---|---|---|---|---|
-| **1 — Classificazione** | GPT-4.1 mini | Legge il PDF, classifica il documento, mappa articoli/clienti | PDF + catalogo/clienti aggiornati | JSON (`tipo`: ordine / quotazione / info / umano) |
-| **2 — Validazione** | GPT-4.1 mini | Verifica l'ordine contro anagrafica e catalogo, non lo modifica mai | JSON ordine + master data | JSON di validazione (VALID / WARNING / INVALID) |
-| **3 — Correzione** | GPT-4.1 mini | Corregge solo errori di formato/mappatura deducibili con certezza | Ordine + esito validazione | Ordine corretto + flag `correggibile` |
+## 1 · Agentic extraction pipeline  (`/agents`)
 
-I prompt completi configurati su Azure AI Foundry per ciascun agente sono in [`prompts/`](prompts/).
+Three GPT-4.1-mini agents orchestrated in Python:
 
-### Loop di validazione/correzione
+| Agent | Role | Output |
+|-------|------|--------|
+| **1 — Classify** | Reads the PDF, returns structured JSON with a confidence score | `{ tipo, confidenza, righe… }` |
+| **2 — Validate** | Checks customer, article codes, prices vs. price list, quantities | `VALID / WARNING / INVALID` |
+| **3 — Correct** | Fixes only what is deducible; max 2 retries, else human escalation | `CORRECTED / manual` |
+
+~€0.005 per order end-to-end, with automatic token/cost logging. Validated results land in the
+Silver tables `silver_validation` and `silver_correction`.
+
+---
+
+## 2 · Data engineering on Microsoft Fabric  (`/fabric`)
+
+Medallion architecture built in a Fabric Lakehouse with **PySpark + Delta**
+(`fabric/notebooks/bronze_to_silver_to_gold.ipynb`):
+
+- **🥉 Bronze** — raw ingestion: customer & product master data and historical ERP orders (CSV), plus the raw agent JSON.
+- **🥈 Silver** — validated & corrected orders from the agents, kept only where status is `VALID`, resolved `WARNING`, or `CORRECTED`.
+- **🥇 Gold** — a **star schema** ready for BI, written as Delta tables (plus optional service CSVs for file-based refresh).
+
+### Data model (star schema)
+
+| Table | Type | Grain | Key(s) | Highlights |
+|-------|------|-------|--------|-----------|
+| `fact_ordini` | Fact | one row per **order line** | `Riga_ID`, `Data_ID`, `Cliente_ID`, `Codice_Articolo` | measures: `Quantita`, `Prezzo_Unitario`, `Importo_Riga` |
+| `dim_clienti` | Dimension | customer | `Cliente_ID` | company, VAT, city, province |
+| `dim_articoli` | Dimension | product | `Codice_Articolo` | category, list price |
+| `dim_data` | Dimension | date | `Data_ID` | year, quarter, month, `AnnoMese`, weekday |
+
+### Data quality built into the model
+- **Two sources, one fact table:** live *agentic* orders are unioned with *historical ERP* orders and de-duplicated, each tagged via `Origine_Dati` and `Pipeline`.
+- **Price-drift detection:** on historical lines, `Scostamento_Prezzo_Pct` flags prices more than **5%** off the official list price.
+- **Completeness flag:** `Dati_Incompleti` marks lines whose customer or product code couldn't be matched.
+- **Column sanitisation** so field names are Delta / SQL-endpoint / DAX friendly and Direct Lake compatible.
+
+---
+
+## 3 · Data analysis in Power BI  (`/powerbi`)
+
+The Gold star schema feeds a Power BI report over **Direct Lake**. Key findings on the demo dataset
+(**81 orders · 19 customers · €381K · €4.7K avg order**):
+
+- **Product mix —** *Utensili* is the top category at **€99K (26%)**, ahead of consumables (€84K) and electrical components (€77K).
+- **Customer concentration —** the **top 5 customers = 46%** of revenue → a commercial-risk signal to monitor.
+- **Seasonality —** recurring revenue peaks in **March and July**, useful for stock & capacity planning.
+- **Governance —** auto-approval rate and average token cost per order are tracked as first-class measures.
+
+> 📷 _Dashboard screenshots in `/powerbi/screenshots`._
+
+---
+
+## 🗂️ Repository structure
 
 ```
-Agente 2 valida ordine originale (tentativo 0)
-    │
-    ├── VALID / WARNING ──────────────────────▶ fine, nessuna correzione necessaria
-    │
-    └── INVALID
-            │
-            ▼
-        Agente 3 valuta l'errore
-            │
-            ├── correggibile = false (errore grande, non recuperabile)
-            │     └──▶ STOP immediato, non consuma altri tentativi, va a operatore umano
-            │
-            └── correggibile = true
-                    │
-                    ▼
-                Applica correzione ──▶ Agente 2 rivalida
-                    │
-                    ├── VALID / WARNING ───────▶ fine, successo
-                    └── ancora INVALID e tentativi < 2 ──▶ riprova, altrimenti STOP
-```
-
-Il limite di **2 tentativi massimi** è una scelta di design deliberata: bilancia
-la resilienza automatica con il controllo dei costi (ogni tentativo = una chiamata LLM)
-ed evita loop infiniti su errori strutturalmente non correggibili (es. un cliente o un
-articolo che semplicemente non esiste — l'agente 3 non inventa mai dati).
-
-Ogni esecuzione produce uno **storico completo** di tutti i tentativi, salvato in
-`storico_ordine.json`, utile sia per audit sia per il debug.
-
-## Struttura del repository
-
-```
-.
-├── src/
-│   ├── main.py                      # Entry point — orchestratore della pipeline
-│   ├── step_1_classificazione.py    # Agente 1 — lettura PDF e classificazione
-│   ├── step_2_validazione.py        # Agente 2 — validazione business
-│   ├── step_3_correzione.py         # Agente 3 — correzione automatica + loop
-│   ├── step_info_quotazione.py      # Gestione casi INFO e QUOTAZIONE (no LLM)
-│   └── step_export_csv.py           # Esportazione ordine validato in CSV per ERP
-│
-├── prompts/
-│   ├── agente1_classificazione.txt  # System prompt configurato su Foundry
-│   ├── agente2_validazione.txt
-│   └── agente3_correzione.txt
-│
+acme-order-management/
+├── agents/                                   # Stage 1 — multi-agent LLM pipeline (Azure AI Foundry)
+├── fabric/
+│   └── notebooks/
+│       └── bronze_to_silver_to_gold.ipynb    # Stage 2 — PySpark medallion → star schema
+├── powerbi/
+│   └── screenshots/                          # dashboard images
 ├── data/
-│   ├── articoli.csv                 # Catalogo prodotti (esempio)
-│   ├── clienti.csv                  # Anagrafica clienti (esempio)
-│   └── pdf_input/                   # PDF di esempio da processare
-│
-├── docs/
-│   └── traccia_progetto.docx        # Traccia originale del project work
-│
-├── .env.example                     # Template variabili d'ambiente (senza credenziali)
-├── .gitignore
-├── requirements.txt
+│   └── sample/                               # small sample Bronze files (no real / sensitive data)
+├── docs/                                     # architecture diagram, notes
 └── README.md
 ```
 
-## Setup
+## ▶️ Reproduce the data layer
 
-**1. Clona il repository e crea un ambiente virtuale**
+1. In a **Microsoft Fabric** workspace, create a **Lakehouse** and upload the Bronze CSVs under `Files/Bronze/…`.
+2. Run the agent stage (`/agents`) so the Silver tables `silver_validation` / `silver_correction` exist.
+3. Import and run `fabric/notebooks/bronze_to_silver_to_gold.ipynb` — it writes the Gold Delta tables (`fact_ordini`, `dim_clienti`, `dim_articoli`, `dim_data`).
+4. In **Power BI**, connect to the Lakehouse via **Direct Lake** and build the report.
 
-```bash
-git clone <url-repo>
-cd <nome-repo>
-python -m venv venv
-source venv/bin/activate   # su Windows: venv\Scripts\activate
-```
+## 🧰 Tech stack
 
-**2. Installa le dipendenze**
+`Python` · `Azure AI Foundry` · `GPT-4.1 mini` · **`PySpark`** · **`Delta Lake`** · **`Microsoft Fabric`** · **`Direct Lake`** · **dimensional modelling (star schema)** · **`Power BI`** · `DAX`
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-**3. Configura le credenziali**
-
-```bash
-cp .env.example .env
-```
-
-Compila `.env` con l'endpoint del tuo progetto Azure AI Foundry e i nomi/versioni
-dei tre agenti (vedi [Prerequisiti Azure](#prerequisiti-azure) sotto).
-
-**4. Autenticati su Azure**
-
-Il progetto usa `DefaultAzureCredential`, quindi è sufficiente essere loggati via CLI:
-
-```bash
-az login
-```
-
-### Prerequisiti Azure
-
-Prima di eseguire la pipeline è necessario aver creato su **Azure AI Foundry**:
-
-- Un progetto AI Foundry con un deployment del modello (es. `gpt-4.1-mini`)
-- Tre agenti configurati con i prompt in [`prompts/`](prompts/):
-  - Agente di classificazione (usato da `step_1_classificazione.py`)
-  - Agente di validazione business (usato da `step_2_validazione.py`)
-  - Agente di correzione ordini (usato da `step_3_correzione.py`)
-
-## Esecuzione
-
-```bash
-cd src
-python main.py ../data/pdf_input/ordine_cliente_A.pdf
-```
-
-Se non specifichi un path, viene usato il PDF di esempio incluso nel repository.
-
-Output a schermo: tipo di documento rilevato, esito di ogni tentativo di
-validazione/correzione, stato finale, e — se l'ordine è valido — il path del
-CSV generato per l'import in ERP.
-
-## Formato dati di input
-
-**`data/articoli.csv`** — colonne attese: `codice, descrizione, categoria, unita_misura, prezzo_listino`
-
-**`data/clienti.csv`** — colonne attese: `id, ragione_sociale, partita_iva, indirizzo, cap, citta, provincia, email, telefono`
-
-Questi due file vengono **ricaricati ad ogni esecuzione**: aggiornare il catalogo
-o l'anagrafica non richiede modifiche al codice né un nuovo deploy.
-
-## Output generati
-
-| File | Quando | Contenuto |
-|---|---|---|
-| `order.json` | sempre | Ultimo JSON prodotto dall'agente 1 |
-| `storico_ordine.json` | se tipo = ordine | Storico completo di validazione/correzione, tentativo per tentativo |
-| `output_csv/ERP_ORDINE_*.csv` | se ordine VALID | Ordine pronto per import in ERP, con metadati di tracciabilità |
-| Email operatore | per INFO / QUOTAZIONE | Bozza di risposta o preventivo, inoltrata via API |
-
-## Principio di design
-
-> L'LLM fa solo le cose che solo l'LLM sa fare. Il codice Python fa tutto il resto.
-
-Ogni chiamata a un modello linguistico introduce latenza, costo e non-determinismo.
-Per questo la pipeline è progettata per usare gli agenti **esclusivamente** per compiti
-di comprensione del linguaggio naturale — classificare un documento, mappare una
-descrizione libera a un codice catalogo, dedurre una correzione plausibile — mentre
-tutto ciò che è calcolabile in modo deterministico (lookup su CSV, calcoli di
-totali/prezzi, instradamento, esportazione file) resta puro Python.
-
-Risultato: **una sola chiamata LLM** per classificare un documento, e al massimo
-altre 2-4 chiamate nel caso di un ordine che richiede validazione e correzione —
-contro le 8-10+ chiamate di un'architettura ad agenti gerarchici meno mirata.
+<sub>Part of my portfolio — see [github.com/FraFico](https://github.com/FraFico).</sub>
